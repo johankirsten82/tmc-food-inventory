@@ -1,4 +1,4 @@
-const C="fi-v33",F=["./","index.html","manifest.json","icons/icon-192.png","icons/icon-512.png","icons/apple-touch-icon.png","icons/favicon-32.png","icons/icon-maskable-512.png","icons/qr.png"];
+const C="fi-v34",F=["./","index.html","manifest.json","icons/icon-192.png","icons/icon-512.png","icons/apple-touch-icon.png","icons/favicon-32.png","icons/icon-maskable-512.png","icons/qr.png"];
 self.addEventListener("install",e=>{e.waitUntil(caches.open(C).then(c=>c.addAll(F)));if(!self.registration.active)self.skipWaiting()});
 self.addEventListener("message",e=>{if(e.data==="skip")self.skipWaiting()});
 self.addEventListener("activate",e=>{e.waitUntil(caches.keys().then(k=>Promise.all(k.filter(x=>x.startsWith("fi-v")&&x!==C).map(x=>caches.delete(x)))));self.clients.claim()});
