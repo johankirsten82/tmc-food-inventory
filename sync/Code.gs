@@ -88,6 +88,87 @@ function pushShortages_(store) {
 }
 /** Optional: add a time trigger (every 15 min) on this so failed sends are retried. */
 function retryShortages() { return pushShortages_(); }
+/* ===== fi-v39 stock handover (HELD — do not deploy until Johan says so) =====
+   Contract: sync/stock-transfer-contract.md
+   Services -> destinationApp tmcservice. Workshops -> WORKSHOP_APP_ID (empty until that app exists).
+   Phone never holds the receiver URL or import code. Empty config leaves the handover queued.
+   HANDOVER_ACK is the server's exactly-once list. A phone status of "accepted" is not trusted.
+   Only ho records are sent. Old Services/Workshops issues with no ho record are not exported. */
+function qtyStr_(q) {
+  var n = Math.round((+q) * 1000) / 1000;
+  if (!(n > 0) || n > 1000000000) return '';
+  return n.toFixed(3).replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '');
+}
+function ackMap_() { try { return JSON.parse(prop_('HANDOVER_ACK', '{}')); } catch (e) { return {}; } }
+function destApp_(destination) {
+  if (destination === 'Services') return 'tmcservice';
+  if (destination === 'Workshops') return String(prop_('WORKSHOP_APP_ID', '')).trim();
+  return '';
+}
+function handoverEndpoint_(app) {
+  if (app === 'tmcservice') return { url: String(prop_('SERVICE_STOCK_URL', '')).trim(), code: String(prop_('SERVICE_STOCK_CODE', '')).trim() };
+  var wid = String(prop_('WORKSHOP_APP_ID', '')).trim();
+  if (wid && app === wid) return { url: String(prop_('WORKSHOP_STOCK_URL', '')).trim(), code: String(prop_('WORKSHOP_STOCK_CODE', '')).trim() };
+  return { url: '', code: '' };
+}
+function handoverPayload_(d, app, code) {
+  var lines = (d.lines || []).map(function (l) {
+    return { id: String(l.id || ''), sourceItemId: String(l.sourceItemId || ''), name: String(l.name || '').slice(0, 120), unit: String(l.unit || '').slice(0, 20), qty: qtyStr_(l.qty) };
+  });
+  return {
+    action: 'importStockTransfer', code: code,
+    transfer: { id: String(d.id), v: 1, sourceApp: 'fi', sourceIssueId: String(d.sourceIssueId || d.id), destinationApp: app, at: String(d.at || ''), by: String(d.by || '').slice(0, 80), qtyScale: 3, lines: lines }
+  };
+}
+function handoverValid_(payload) {
+  var t = payload.transfer, idOk = function (s) { return typeof s === 'string' && /^[A-Za-z0-9_-]{4,64}$/.test(s); };
+  if (!t || !idOk(t.id) || t.sourceApp !== 'fi' || t.sourceIssueId !== t.id || !idOk(t.destinationApp) || t.qtyScale !== 3) return false;
+  if (!t.lines || !t.lines.length || t.lines.length > 40) return false;
+  return t.lines.every(function (l) { return idOk(l.id) && idOk(l.sourceItemId) && l.name && /^\d{1,9}(\.\d{1,3})?$/.test(l.qty) && l.qty !== '0'; });
+}
+function writeHo_(store, rec, data, now) {
+  merge_(store, [{ kind: 'ho', id: rec.id, u: Math.max(now, (rec.u || 0) + 1), data: data }], 'food-handover', now);
+}
+function pushHandovers_(store) {
+  store = store || readAll_();
+  var ack = ackMap_(), now = Date.now(), posted = 0, held = 0;
+  Object.keys(store.map).forEach(function (k) {
+    var rec = store.map[k];
+    if (!rec || rec.kind !== 'ho' || rec.del) return;
+    var d = safeParse_(rec.data);
+    if (!d || !d.id) return;
+    if (ack[d.id]) {
+      if (d.status !== 'accepted' || d.ack !== 1) { d.status = 'accepted'; d.ack = 1; d.error = ''; writeHo_(store, rec, d, now); }
+      return;
+    }
+    var app = destApp_(d.destination), ep = handoverEndpoint_(app);
+    d.destinationApp = app || '';
+    if (!app || !ep.url || !ep.code) {
+      var why = !app ? 'app_id_unset' : 'endpoint_unset';
+      if (d.status !== 'queued' || d.error !== why || d.ack) { d.status = 'queued'; d.error = why; d.ack = 0; d.destinationApp = app || ''; writeHo_(store, rec, d, now); }
+      held++; return;
+    }
+    var payload = handoverPayload_(d, app, ep.code);
+    if (!handoverValid_(payload)) { d.status = 'rejected'; d.error = 'bad_qty'; d.ack = 0; writeHo_(store, rec, d, now); return; }
+    var res, text = '', code = 0;
+    try {
+      res = UrlFetchApp.fetch(ep.url, { method: 'post', contentType: 'text/plain;charset=utf-8', muteHttpExceptions: true, followRedirects: true, payload: JSON.stringify(payload) });
+      code = res.getResponseCode(); text = res.getContentText();
+    } catch (e) { d.status = 'queued'; d.error = 'no_ack'; d.ack = 0; writeHo_(store, rec, d, now); return; }
+    var j = safeParse_(text);
+    if (j && j.ok === true && j.transferId === d.id && (j.result === 'accepted' || j.result === 'duplicate')) {
+      ack[d.id] = 1; d.status = 'accepted'; d.ack = 1; d.error = ''; d.acceptedAt = new Date(now).toISOString(); posted++;
+    } else if (j && j.ok === false && j.error === 'bad_code') { d.status = 'queued'; d.error = 'bad_code'; d.ack = 0; }
+    else if (j && j.ok === false && j.error) { d.status = 'rejected'; d.error = String(j.error).slice(0, 40); d.ack = 0; }
+    else { d.status = 'queued'; d.error = 'no_ack'; d.ack = 0; }
+    writeHo_(store, rec, d, now);
+  });
+  if (posted) PropertiesService.getScriptProperties().setProperty('HANDOVER_ACK', JSON.stringify(ack));
+  var dirty = false;
+  Object.keys(store.map).forEach(function (k) { if (store.map[k].dirty) dirty = true; });
+  if (dirty) writeRecs_(store);
+  return { ok: true, posted: posted, held: held };
+}
 function out_(o) {
   return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON);
 }
@@ -362,6 +443,7 @@ function handle_(req) {
     var warn = '';
     if (acc) { writeRecs_(store); try { rebuildViews_(store); } catch (ve) { warn = 'views: ' + String(ve && ve.message || ve).slice(0, 200); } }
     if ((req.changes || []).some(function (c) { return c && c.kind === 'shortage'; })) { try { var ps = pushShortages_(store); if (ps.error) warn += ' purshes: ' + ps.error; } catch (pe) { warn += ' purshes: ' + String(pe).slice(0, 100); } }
+    if (au.approved) { try { pushHandovers_(store); } catch (he) { warn += ' handover: ' + String(he && he.message || he).slice(0, 120); } }
     var recs = changedSince_(store, since);
     if (!au.approved) recs = recs.filter(function (x) { return x.kind === 'u' && String(x.id) === String(req.user || ''); });
     recs = stripRecs_(recs, viaCode ? '' : (me ? req.user : ''));   // v10: every path (team code, legacy, Admin, staff): only your own PIN hash
@@ -569,4 +651,4 @@ function setupOnce(opt) {
     return JSON.stringify(out);
   } finally { lock.releaseLock(); }
 }
-if (typeof module !== 'undefined') module.exports = { stripRecs_: stripRecs_, keepPins_: keepPins_, readAll_: readAll_, normName_: normName_, nameKey_: nameKey_, openReq_: openReq_, openStatus_: openStatus_, handle_: handle_, merge_: merge_, rebuildViews_: rebuildViews_, importIncoming_: importIncoming_, pushShortages_: pushShortages_, setupOnce: setupOnce };
+if (typeof module !== 'undefined') module.exports = { stripRecs_: stripRecs_, keepPins_: keepPins_, readAll_: readAll_, normName_: normName_, nameKey_: nameKey_, openReq_: openReq_, openStatus_: openStatus_, handle_: handle_, merge_: merge_, rebuildViews_: rebuildViews_, importIncoming_: importIncoming_, pushShortages_: pushShortages_, pushHandovers_: pushHandovers_, handoverPayload_: handoverPayload_, qtyStr_: qtyStr_, setupOnce: setupOnce };
