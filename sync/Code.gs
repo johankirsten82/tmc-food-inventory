@@ -31,6 +31,10 @@ var PURSHES_IMPORT_CODE = '';
 var NONFOOD = ['welding', 'shovel', 'cable', 'plug', 'blanket', 'sheep food', 'tubing', 'grease', 'socket'];
 function isNonFood_(name) { var l = String(name || '').toLowerCase(); return NONFOOD.some(function (w) { return l.indexOf(w) >= 0; }); }
 var KITCHENS = ['Store Room', 'HQ Kitchen', 'GZ Kitchen', 'Expats Kitchen', '1Alfa Camp Kitchen'];
+/* fi-v38 (held — do not deploy until Johan says so): Services and Workshops are issue destinations
+   inside this Food sheet, same xfer rows as kitchens. Not a bridge to any other TMC app.
+   Issues and Kitchen usage already store whatever is in m.to. Summary lists the known destinations. */
+var ISSUE_DESTS = ['HQ Kitchen', 'GZ Kitchen', 'Expats Kitchen', '1Alfa Camp Kitchen', 'Services', 'Workshops'];
 var REC = '_Records';   // raw data used by the app (do not edit by hand)
 var REC_HEAD = ['Key', 'Kind', 'Id', 'UpdatedAt', 'Deleted', 'ServerTime', 'Device', 'Json'];
 
@@ -203,7 +207,7 @@ function rebuildViews_(store) {
   /* Summary: Store Room status + what each kitchen got this week */
   var thisWk = monK_(Date.now()), l0 = its.filter(low).length;
   var SUM = [['Store Room', its.length + ' items', l0 + ' to reorder', l0 ? 'REORDER' : 'OK']];
-  KITCHENS.filter(function (k) { return k !== 'Store Room'; }).forEach(function (k) {
+  ISSUE_DESTS.forEach(function (k) {
     var mine = ISS.filter(function (m) { return m.to === k && monK_(Date.parse(m.at)) === thisWk; }), ev = {};
     mine.forEach(function (m) { ev[m.xfer || m.id] = 1; });
     SUM.push([k, Object.keys(ev).length + ' issues this week', mine.length + ' lines', '']); });
