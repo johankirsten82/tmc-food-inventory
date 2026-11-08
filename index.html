@@ -318,7 +318,7 @@ function saveXfer(){if(!can("xfer"))return;const x=S.xf;if(!x||x.saving)return;i
  ls.forEach(l=>{const src=all("i").find(z=>z.id===l.item);
   const mid=uid(),qty=Math.round(+l.qty*1000)/1000;put("m",mid,{id:mid,type:"xfer",kitchen:x.from,item:src.id,qty,to:dest,at,by:meU().name,note:"",xfer:xid});
   if(hand)hl.push({id:mid,sourceItemId:src.id,name:src.name,unit:src.unit||"",qty})});
- if(hand)put("ho",xid,{id:xid,v:1,destination:dest,destinationApp:dest==="Services"?"tmcservice":"",status:"queued",at,by:meU().name,sourceIssueId:xid,qtyScale:3,lines:hl});
+ if(hand)put("ho",xid,{id:xid,v:1,destination:dest,destinationApp:dest==="Services"?"tmcservice":"tmcworkshop",status:"queued",at,by:meU().name,sourceIssueId:xid,qtyScale:3,lines:hl});
  S.xf=null;clearDraft();toast(hand?t("hoQueued"):"🔁 "+ls.length+" → "+t(dest));go("move")}
 function hoMark(m){if(!m||m.type!=="xfer"||!ISSUE_TO.includes(m.to))return "";const h=all("ho").find(x=>x.id===m.xfer);if(!h)return "";const k=h.status==="accepted"?"hoAccepted":h.status==="rejected"?"hoRejected":"hoQueued";return `<br><span class="hoSt" data-ho="${esc(h.status)}">${esc(t(k))}</span>`}
 function shortView(){if(!can("short"))return V.home();const A=all("shortage").sort((a,b)=>(a.status!=="open")-(b.status!=="open")||b.at.localeCompare(a.at));

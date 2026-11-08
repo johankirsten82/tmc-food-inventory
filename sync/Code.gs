@@ -90,25 +90,53 @@ function pushShortages_(store) {
 function retryShortages() { return pushShortages_(); }
 /* ===== fi-v39 stock handover (HELD — do not deploy until Johan says so) =====
    Contract: sync/stock-transfer-contract.md
-   Services -> destinationApp tmcservice. Workshops -> WORKSHOP_APP_ID (empty until that app exists).
-   Phone never holds the receiver URL or import code. Empty config leaves the handover queued.
-   HANDOVER_ACK is the server's exactly-once list. A phone status of "accepted" is not trusted.
-   Only ho records are sent. Old Services/Workshops issues with no ho record are not exported. */
+   Services -> tmcservice. Workshops -> tmcworkshop (confirmed app id, not a secret).
+   SERVICE_STOCK_URL / SERVICE_STOCK_CODE / WORKSHOP_STOCK_URL / WORKSHOP_STOCK_CODE stay empty until an approved deployment.
+   The transfer object is frozen on first send (canon). A later phone edit is not what we resend.
+   Accepted ids are stored in HANDOVER_ACK_<n> shards of at most ACK_BYTES, so one property cannot grow without bound and drop older ids.
+   A legacy HANDOVER_ACK value is still read. Only ho records are sent. Old issues with no ho record are not exported. */
+var ACK_BYTES = 8000;
 function qtyStr_(q) {
   var n = Math.round((+q) * 1000) / 1000;
   if (!(n > 0) || n > 1000000000) return '';
   return n.toFixed(3).replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '');
 }
-function ackMap_() { try { return JSON.parse(prop_('HANDOVER_ACK', '{}')); } catch (e) { return {}; } }
+function ackLoad_() {
+  var p = PropertiesService.getScriptProperties().getProperties(), map = {};
+  Object.keys(p).forEach(function (k) {
+    if (k !== 'HANDOVER_ACK' && k.indexOf('HANDOVER_ACK_') !== 0) return;
+    var o; try { o = JSON.parse(p[k] || '{}'); } catch (e) { return; }
+    if (!o || typeof o !== 'object') return;
+    Object.keys(o).forEach(function (id) { if (o[id]) map[id] = 1; });
+  });
+  return map;
+}
+function ackAdd_(id) {
+  var p = PropertiesService.getScriptProperties(), all = p.getProperties(), n = 0, raw = '', seen = false;
+  Object.keys(all).forEach(function (k) {
+    var m = /^HANDOVER_ACK_(\d+)$/.exec(k);
+    if (!m) return;
+    seen = true;
+    if (+m[1] >= n) { n = +m[1]; raw = all[k] || ''; }
+  });
+  var o = {};
+  try { o = raw ? JSON.parse(raw) : {}; } catch (e) { o = {}; }
+  if (!o || typeof o !== 'object') o = {};
+  if (o[id]) return;
+  o[id] = 1;
+  var s = JSON.stringify(o);
+  if (seen && raw && s.length > ACK_BYTES) { o = {}; o[id] = 1; s = JSON.stringify(o); n += 1; }
+  if (s.length > ACK_BYTES) return;
+  p.setProperty('HANDOVER_ACK_' + n, s);
+}
 function destApp_(destination) {
   if (destination === 'Services') return 'tmcservice';
-  if (destination === 'Workshops') return String(prop_('WORKSHOP_APP_ID', '')).trim();
+  if (destination === 'Workshops') return 'tmcworkshop';
   return '';
 }
 function handoverEndpoint_(app) {
   if (app === 'tmcservice') return { url: String(prop_('SERVICE_STOCK_URL', '')).trim(), code: String(prop_('SERVICE_STOCK_CODE', '')).trim() };
-  var wid = String(prop_('WORKSHOP_APP_ID', '')).trim();
-  if (wid && app === wid) return { url: String(prop_('WORKSHOP_STOCK_URL', '')).trim(), code: String(prop_('WORKSHOP_STOCK_CODE', '')).trim() };
+  if (app === 'tmcworkshop') return { url: String(prop_('WORKSHOP_STOCK_URL', '')).trim(), code: String(prop_('WORKSHOP_STOCK_CODE', '')).trim() };
   return { url: '', code: '' };
 }
 function handoverPayload_(d, app, code) {
@@ -129,41 +157,63 @@ function handoverValid_(payload) {
 function writeHo_(store, rec, data, now) {
   merge_(store, [{ kind: 'ho', id: rec.id, u: Math.max(now, (rec.u || 0) + 1), data: data }], 'food-handover', now);
 }
+function keepHo_(store, changes) {
+  return (changes || []).map(function (c) {
+    if (!c || String(c.kind) !== 'ho' || c.del || !c.data || typeof c.data !== 'object') return c;
+    var o = store.map['ho:' + c.id], old = o && !o.del ? safeParse_(o.data) : null;
+    if (!old || !old.canon) return c;
+    var d = Object.assign({}, c.data);
+    d.canon = old.canon; d.lines = old.lines; d.destination = old.destination;
+    d.destinationApp = old.canon.destinationApp || old.destinationApp;
+    d.sourceIssueId = old.sourceIssueId || old.canon.id;
+    if (old.status === 'accepted' || old.ack === 1) { d.status = 'accepted'; d.ack = 1; d.error = ''; if (old.acceptedAt) d.acceptedAt = old.acceptedAt; }
+    return { kind: c.kind, id: c.id, u: c.u, del: c.del, purge: c.purge, data: d };
+  });
+}
 function pushHandovers_(store) {
   store = store || readAll_();
-  var ack = ackMap_(), now = Date.now(), posted = 0, held = 0;
+  var ack = ackLoad_(), now = Date.now(), posted = 0, held = 0;
   Object.keys(store.map).forEach(function (k) {
     var rec = store.map[k];
     if (!rec || rec.kind !== 'ho' || rec.del) return;
     var d = safeParse_(rec.data);
     if (!d || !d.id) return;
     if (ack[d.id]) {
-      if (d.status !== 'accepted' || d.ack !== 1) { d.status = 'accepted'; d.ack = 1; d.error = ''; writeHo_(store, rec, d, now); }
+      if (d.status !== 'accepted' || d.ack !== 1 || d.error) { d.status = 'accepted'; d.ack = 1; d.error = ''; writeHo_(store, rec, d, now); }
       return;
     }
     var app = destApp_(d.destination), ep = handoverEndpoint_(app);
-    d.destinationApp = app || '';
+    if (!d.canon) d.destinationApp = app || '';
     if (!app || !ep.url || !ep.code) {
       var why = !app ? 'app_id_unset' : 'endpoint_unset';
-      if (d.status !== 'queued' || d.error !== why || d.ack) { d.status = 'queued'; d.error = why; d.ack = 0; d.destinationApp = app || ''; writeHo_(store, rec, d, now); }
+      if (d.status !== 'queued' || d.error !== why || d.ack) { d.status = 'queued'; d.error = why; d.ack = 0; if (!d.canon) d.destinationApp = app || ''; writeHo_(store, rec, d, now); }
       held++; return;
     }
-    var payload = handoverPayload_(d, app, ep.code);
-    if (!handoverValid_(payload)) { d.status = 'rejected'; d.error = 'bad_qty'; d.ack = 0; writeHo_(store, rec, d, now); return; }
-    var res, text = '', code = 0;
+    if (!d.canon) {
+      var built = handoverPayload_(d, app, ep.code);
+      if (!handoverValid_(built)) { d.status = 'rejected'; d.error = 'bad_qty'; d.ack = 0; writeHo_(store, rec, d, now); return; }
+      d.canon = built.transfer; d.destinationApp = app;
+      writeHo_(store, rec, d, now); writeRecs_(store);
+      rec = store.map['ho:' + d.id] || rec;
+    }
+    var payload = { action: 'importStockTransfer', code: ep.code, transfer: d.canon };
+    var res, text = '';
     try {
       res = UrlFetchApp.fetch(ep.url, { method: 'post', contentType: 'text/plain;charset=utf-8', muteHttpExceptions: true, followRedirects: true, payload: JSON.stringify(payload) });
-      code = res.getResponseCode(); text = res.getContentText();
-    } catch (e) { d.status = 'queued'; d.error = 'no_ack'; d.ack = 0; writeHo_(store, rec, d, now); return; }
+      text = res.getContentText();
+    } catch (e) {
+      if (d.status !== 'queued' || d.error !== 'no_ack') { d.status = 'queued'; d.error = 'no_ack'; d.ack = 0; writeHo_(store, rec, d, now); }
+      return;
+    }
     var j = safeParse_(text);
     if (j && j.ok === true && j.transferId === d.id && (j.result === 'accepted' || j.result === 'duplicate')) {
-      ack[d.id] = 1; d.status = 'accepted'; d.ack = 1; d.error = ''; d.acceptedAt = new Date(now).toISOString(); posted++;
-    } else if (j && j.ok === false && j.error === 'bad_code') { d.status = 'queued'; d.error = 'bad_code'; d.ack = 0; }
+      ackAdd_(d.id); ack[d.id] = 1; d.status = 'accepted'; d.ack = 1; d.error = ''; d.acceptedAt = new Date(now).toISOString(); posted++;
+    } else if (ack[d.id]) { d.status = 'accepted'; d.ack = 1; d.error = ''; }
+    else if (j && j.ok === false && j.error === 'bad_code') { d.status = 'queued'; d.error = 'bad_code'; d.ack = 0; }
     else if (j && j.ok === false && j.error) { d.status = 'rejected'; d.error = String(j.error).slice(0, 40); d.ack = 0; }
     else { d.status = 'queued'; d.error = 'no_ack'; d.ack = 0; }
     writeHo_(store, rec, d, now);
   });
-  if (posted) PropertiesService.getScriptProperties().setProperty('HANDOVER_ACK', JSON.stringify(ack));
   var dirty = false;
   Object.keys(store.map).forEach(function (k) { if (store.map[k].dirty) dirty = true; });
   if (dirty) writeRecs_(store);
@@ -422,7 +472,7 @@ function handle_(req) {
       var ss = session_(store, req.token, req.device); if (ss.error) return { ok: false, error: ss.error };
       me = ss.u; req.user = ss.id;
     }
-    req.changes = keepPins_(store, req.changes);   // v10
+    req.changes = keepHo_(store, keepPins_(store, req.changes));   // v10 pins; frozen handover canon is not replaced by a later phone edit
     var refused = { n: 0, dup: 0, add: 0, strict: 0 };
     if (viaCode && strict_()) req.changes = (req.changes || []).filter(function (c) { if (c && c.kind === 'u') { refused.strict++; return false; } return true; });   /* v11 STRICT_TOKEN: users only via a signed-in token */
     if (viaCode) {   /* v12: with the team code only your OWN user record, and never an Admin record (no Admin edits/approvals via the code) */
@@ -651,4 +701,4 @@ function setupOnce(opt) {
     return JSON.stringify(out);
   } finally { lock.releaseLock(); }
 }
-if (typeof module !== 'undefined') module.exports = { stripRecs_: stripRecs_, keepPins_: keepPins_, readAll_: readAll_, normName_: normName_, nameKey_: nameKey_, openReq_: openReq_, openStatus_: openStatus_, handle_: handle_, merge_: merge_, rebuildViews_: rebuildViews_, importIncoming_: importIncoming_, pushShortages_: pushShortages_, pushHandovers_: pushHandovers_, handoverPayload_: handoverPayload_, qtyStr_: qtyStr_, setupOnce: setupOnce };
+if (typeof module !== 'undefined') module.exports = { stripRecs_: stripRecs_, keepPins_: keepPins_, keepHo_: keepHo_, readAll_: readAll_, normName_: normName_, nameKey_: nameKey_, openReq_: openReq_, openStatus_: openStatus_, handle_: handle_, merge_: merge_, rebuildViews_: rebuildViews_, importIncoming_: importIncoming_, pushShortages_: pushShortages_, pushHandovers_: pushHandovers_, handoverPayload_: handoverPayload_, qtyStr_: qtyStr_, ackLoad_: ackLoad_, ackAdd_: ackAdd_, ACK_BYTES: ACK_BYTES, setupOnce: setupOnce };

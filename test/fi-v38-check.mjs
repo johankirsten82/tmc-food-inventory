@@ -345,7 +345,7 @@ await shot("#mvRecent", "food_issue_history_sample.png");
 const recent = await page.$eval("#mvRecent", e => e.innerText);
 ok("recent history names each destination", ["SAMPLE Rice", "Services", "Workshops", "HQ Kitchen"].every(s => recent.includes(s)), recent.slice(0, 500));
 const hos = await page.evaluate(() => all("ho").map(h => ({to: h.destination, st: h.status, app: h.destinationApp, n: (h.lines || []).length, issue: h.sourceIssueId === h.id})));
-ok("new Services and Workshops issues queue a handover", hos.length === 2 && hos.every(h => h.st === "queued" && h.n === 1 && h.issue) && hos.some(h => h.to === "Services" && h.app === "tmcservice") && hos.some(h => h.to === "Workshops" && h.app === ""), JSON.stringify(hos));
+ok("new Services and Workshops issues queue a handover", hos.length === 2 && hos.every(h => h.st === "queued" && h.n === 1 && h.issue) && hos.some(h => h.to === "Services" && h.app === "tmcservice") && hos.some(h => h.to === "Workshops" && h.app === "tmcworkshop"), JSON.stringify(hos));
 ok("queued handover is not marked received", recent.includes("Queued") && !recent.includes("In their stock"), recent.slice(0, 500));
 
 await page.evaluate(() => { rp.id = "where"; go("reports"); });
