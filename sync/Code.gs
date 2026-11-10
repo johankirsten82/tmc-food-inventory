@@ -1,4 +1,15 @@
 /**
+ * SERVER v14 (fi-v39): v13 Block / Reject = REMOVE merged into the fi-v38/v39 server (Services / Workshops issue
+ *   destinations + held stock handover). Nothing dropped from either. SERVICE_STOCK_URL / SERVICE_STOCK_CODE /
+ *   WORKSHOP_STOCK_URL / WORKSHOP_STOCK_CODE stay EMPTY until an approved deployment: Services / Workshops issues stay queued.
+ * SERVER v13 (fi-v35, TMC base VER 7 port, Food protocol): Block / Reject = REMOVE.
+ *   A user delete (del:1, purge:1 and/or data.discarded:1) is accepted ONLY from an Admin TOKEN (never the team code,
+ *   never staff), never for the Admin's own record and never for the last active Admin (refusedWhy admin_only_fix /
+ *   self / last_admin, ids in refusedDiscard). On success every TOK_* session of that user is deleted, so the old token
+ *   stops working; the user record leaves the user list (the Sheet keeps a {discarded:1} marker row, no name, no PIN).
+ *   The old PIN no longer signs in: the same name + PIN now only creates a FRESH request (status 'wait' = Pending).
+ *   'status' answers 'gone' to the removed phone (same device) so it shows "Not approved – Send a new request".
+ *   There is no Unblock: older blocked/rejected records can only be removed.
  * SERVER v12 (fi-v34): a session token ALWAYS wins over the team code (viaCode only when no token is sent).
  *   Admin fixes need the Admin's token; fixes sent with the team code are refused (refusedWhy 'admin_only_fix').
  *   Via the team code a phone may only touch its OWN user record and never an Admin record.
@@ -249,11 +260,11 @@ function merge_(store, changes, device, now) {
   (changes || []).forEach(function (c) {
     if (!c || !c.kind || c.id === undefined || c.id === null) return;
     /* v9: users are never removed or blanked by a sync/restore; only an explicit purge:1 delete (Admin) removes one */
-    if (String(c.kind) === 'u' && !(c.del && c.purge === 1) && (c.del || c.data == null || typeof c.data !== 'object')) return;
+    if (String(c.kind) === 'u' && !(c.del && (c.purge === 1 || c._discard === 1)) && (c.del || c.data == null || typeof c.data !== 'object')) return;
     var key = c.kind + ':' + c.id, old = store.map[key], u = Number(c.u) || 0;
     if (old && old.u >= u) return;                 // server copy is newer or same
     var rec = { key: key, kind: c.kind, id: String(c.id), u: u, del: c.del ? 1 : 0, s: now, dev: device || '',
-                data: c.del ? '' : JSON.stringify(c.data == null ? null : c.data), row: old ? old.row : 0 };
+                data: c.del ? (c._discard === 1 ? JSON.stringify({ discarded: 1, at: new Date(now).toISOString(), dev: c._dev || '' }) : '') : JSON.stringify(c.data == null ? null : c.data), row: old ? old.row : 0 };
     store.map[key] = rec; rec.dirty = true; acc++;
   });
   return acc;
@@ -460,6 +471,33 @@ function noAdd_(store, me, changes, refused) {
     refused.add++; return false;
   });
 }
+/* v13 (TMC base VER 7 discard, Food semantics): a user delete removes the person. Admin TOKEN only (me = null on the team
+   code), never yourself, never the last active Admin. Deletes the user's TOK_* sessions. Refusals: refused.disc (ids) +
+   refused.discWhy. me comes only from a checked session (session_ refuses non-active users). Also accepts base-shaped records (admin:1, status 'active') so the base discard unit test can run. */
+function isAdm_(u) { return !!u && (u.role === 'admin' || u.admin === 1 || u.admin === true); }
+function isOn_(u) { return !!u && (u.status === 'ok' || u.status === 'active'); }
+function discard_(store, me, changes, refused) {
+  var U = users_(store);
+  return (changes || []).filter(function (c) {
+    if (!c || c.kind !== 'u') return true;
+    // v13 (base VER 7 + Food rule): the main Admin = an APPROVED Admin whose name is JA Kirsten or an alias. Nobody can remove, block,
+    // reject, demote or rename them away from the main name. A PIN reset (pinH) and other edits stay allowed. A pending or
+    // non-admin user with that name is NOT protected (an impostor request can still be rejected).
+    var cur = U[String(c.id)], d = c.data || {}, st = d.status;
+    var mainA = !!cur && nameKey_(cur.name) === 'jakirsten' && isAdm_(cur) && isOn_(cur);
+    if (mainA && (c.del || st === 'blocked' || st === 'rejected' || st === 'removed' || !c.data || !isAdm_(d) || nameKey_(d.name) !== 'jakirsten')) { refused.disc = refused.disc || []; refused.disc.push(String(c.id)); refused.discWhy = 'main_admin'; return false; }
+    if (!c.del) return true;
+    if (!(c.purge === 1 || (c.data && c.data.discarded === 1))) return true;   // plain deletes stay refused by merge_
+    var id = String(c.id), u = U[id];
+    if (!u) return false;                                                       // already gone: nothing to do
+    var why = !(me && isAdm_(me) && (me.status === undefined || isOn_(me))) ? 'admin_only_fix' : id === String(me.id) ? 'self' :
+      (isAdm_(u) && !Object.keys(U).some(function (k) { return k !== id && isAdm_(U[k]) && isOn_(U[k]); })) ? 'last_admin' : '';
+    if (why) { refused.disc = refused.disc || []; refused.disc.push(id); refused.discWhy = why; return false; }
+    var p = props_(), all = p.getProperties();
+    Object.keys(all).forEach(function (k) { if (k.indexOf('TOK_') !== 0) return; try { if (String(JSON.parse(all[k]).uid) === id) p.deleteProperty(k); } catch (e) {} });
+    c._discard = 1; c.purge = 1; c._dev = String(u.dev || ''); return true;
+  });
+}
 function handle_(req) {
   if (!req) return { ok: false, error: 'bad_request' };
   var code = String(req.code || '').trim(), viaCode = !req.token && !!code && code === teamCode_();   // v12: a token always wins over the code
@@ -474,6 +512,7 @@ function handle_(req) {
     }
     req.changes = keepHo_(store, keepPins_(store, req.changes));   // v10 pins; frozen handover canon is not replaced by a later phone edit
     var refused = { n: 0, dup: 0, add: 0, strict: 0 };
+    req.changes = discard_(store, viaCode || !me ? null : Object.assign({ id: String(req.user || '') }, me), req.changes, refused);   // v13: remove-on-block, Admin token only
     if (viaCode && strict_()) req.changes = (req.changes || []).filter(function (c) { if (c && c.kind === 'u') { refused.strict++; return false; } return true; });   /* v11 STRICT_TOKEN: users only via a signed-in token */
     if (viaCode) {   /* v12: with the team code only your OWN user record, and never an Admin record (no Admin edits/approvals via the code) */
       var U0 = users_(store), anyA0 = Object.keys(U0).some(function (id) { return U0[id].role === 'admin' && U0[id].status === 'ok'; });
@@ -502,6 +541,7 @@ function handle_(req) {
     if (refused.add) { res.refused = (res.refused || 0) + refused.add; res.refusedWhy = 'not_allowed'; }
     if (refused.dup) { res.refused = (res.refused || 0) + refused.dup; res.refusedWhy = 'duplicate_request'; }
     if (refused.strict) { res.refused = (res.refused || 0) + refused.strict; res.refusedWhy = 'need_token'; }
+    if (refused.disc) { res.refused = (res.refused || 0) + refused.disc.length; res.refusedWhy = refused.discWhy; res.refusedDiscard = refused.disc; }   // v13
     if (warn) res.warn = warn;
     return res;
   } finally { lock.releaseLock(); }
@@ -615,7 +655,9 @@ function openStatus_(req) {
   var user = String(req.user || ''), dev = String(req.device || ''), pinH = String(req.pinH || '');
   if (!idOk_(user) || !idOk_(dev)) return { ok: false, error: 'bad_request' };
   if (!rate_('st:' + dev, 5)) return { ok: false, error: 'slow_down' };
-  var d = users_(readAll_())[user];
+  var st0 = readAll_(), d = users_(st0)[user];
+  if (!d) { var g = st0.map['u:' + user], gd = g && g.del ? safeParse_(g.data) : null;   // v13: removed by the Admin -> 'gone' (same phone only)
+    if (gd && gd.discarded === 1 && gd.dev === dev) return { ok: true, status: 'gone' }; }
   if (!d || d.dev !== dev) return { ok: true, status: 'none' };
   if (d.status !== 'ok') return { ok: true, status: d.status === 'wait' ? 'wait' : 'denied' };
   var nk = 'n:' + nameKey_(d.name), dk = 'd:' + dev;
@@ -649,7 +691,7 @@ function doPost(e) {
 }
 function doGet(e) {
   var p = (e && e.parameter) || {};
-  if (!p.code) return out_({ ok: true, app: 'TMC Food Inventory sync', hint: 'running' });
+  if (!p.code) return out_({ ok: true, app: 'TMC Food Inventory sync', hint: 'running', server: 'v14' });   // v14: version marker for the post-deploy check (no data, no code)
   try { return out_(handle_({ code: p.code, since: p.since, changes: [] })); }
   catch (err) { return out_({ ok: false, error: String(err) }); }
 }
